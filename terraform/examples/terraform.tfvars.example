@@ -1,0 +1,30 @@
+# AWS Configuration
+aws_region   = "us-west-2"
+project_name = "eks-assessment"
+environment  = "dev"
+
+# Cluster Configuration
+kubernetes_version = "1.28"
+
+# Network Configuration
+vpc_cidr                 = "10.0.0.0/16"
+availability_zones_count = 3
+
+# Security Configuration
+enable_public_access = true
+public_access_cidrs  = ["0.0.0.0/0"]  # Restrict this in production!
+
+# Node Configuration
+node_instance_types = ["t3.medium"]
+node_capacity_type  = "ON_DEMAND"  # Use "SPOT" for cost savings in non-prod
+node_min_size       = 2
+node_max_size       = 10
+node_desired_size   = 2
+node_disk_size      = 50
+
+# Logging
+log_retention_days = 7
+
+# Application Configuration
+app_namespace       = "default"
+app_service_account = "app-sa"

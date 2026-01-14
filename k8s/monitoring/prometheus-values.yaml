@@ -1,0 +1,162 @@
+# Prometheus Helm chart values
+# Install with: helm install prometheus prometheus-community/kube-prometheus-stack -f prometheus-values.yaml
+
+# Prometheus configuration
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 50Gi
+          storageClassName: gp3
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: 1000m
+        memory: 4Gi
+
+    # Service account for IRSA
+    serviceAccount:
+      create: true
+      name: prometheus-sa
+      annotations:
+        eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT_ID:role/prometheus-role"
+
+    # Additional scrape configs
+    additionalScrapeConfigs:
+    - job_name: 'demo-app'
+      kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+          - default
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+
+# Grafana configuration
+grafana:
+  enabled: true
+  adminPassword: "changeme123!"  # Change this in production!
+
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClassName: gp3
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 200m
+      memory: 512Mi
+
+  # Ingress configuration
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    hosts:
+    - grafana.example.com
+
+  # Pre-configured dashboards
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+      - name: 'default'
+        orgId: 1
+        folder: ''
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/default
+
+  # Custom dashboards
+  dashboards:
+    default:
+      eks-cluster:
+        gnetId: 14623
+        revision: 1
+        datasource: Prometheus
+      kubernetes-cluster:
+        gnetId: 7249
+        revision: 1
+        datasource: Prometheus
+      node-exporter:
+        gnetId: 1860
+        revision: 27
+        datasource: Prometheus
+
+# Alert Manager configuration
+alertmanager:
+  enabled: true
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'cluster', 'service']
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 12h
+      receiver: 'default'
+      routes:
+      - match:
+          alertname: Watchdog
+        receiver: 'null'
+    receivers:
+    - name: 'null'
+    - name: 'default'
+      # Configure your notification channels here
+      # slack_configs:
+      # - api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
+      #   channel: '#alerts'
+
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+          storageClassName: gp3
+
+# Node exporter configuration
+nodeExporter:
+  enabled: true
+
+# Kube state metrics
+kubeStateMetrics:
+  enabled: true
+
+# Prometheus operator configuration
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi

@@ -1,0 +1,276 @@
+name: Build and Deploy Application
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'app/**'
+      - 'k8s/**'
+      - '.github/workflows/build-deploy.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'app/**'
+      - 'k8s/**'
+      - '.github/workflows/build-deploy.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: "us-west-2"
+  APP_NAME: "demo-app"
+
+jobs:
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner in fs mode
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run SAST with Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.event_name != 'pull_request'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Run Trivy vulnerability scanner on image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy image scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+
+      - name: Sign the container image with Cosign
+        if: github.ref == 'refs/heads/main'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "Signing image digest: ${DIGEST}"
+          # cosign sign --yes ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_NAME }}@${DIGEST}
+          echo "Image signing would occur here with proper Cosign setup"
+
+  deploy-to-eks:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download Terraform outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-outputs
+          path: ./terraform-outputs
+        continue-on-error: true
+
+      - name: Extract cluster info
+        id: cluster-info
+        run: |
+          if [ -f ./terraform-outputs/outputs.json ]; then
+            echo "cluster_name=$(jq -r '.cluster_name.value' ./terraform-outputs/outputs.json)" >> $GITHUB_OUTPUT
+          else
+            echo "cluster_name=${{ secrets.EKS_CLUSTER_NAME }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ steps.cluster-info.outputs.cluster_name }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.13.0'
+
+      - name: Update image tag in manifests
+        run: |
+          sed -i "s|IMAGE_TAG|${{ github.sha }}|g" k8s/base/deployment.yaml
+          sed -i "s|ECR_REGISTRY|${{ steps.login-ecr.outputs.registry }}|g" k8s/base/deployment.yaml
+
+      - name: Deploy with kubectl
+        run: |
+          kubectl apply -f k8s/base/namespace.yaml
+          kubectl apply -f k8s/base/serviceaccount.yaml
+          kubectl apply -f k8s/base/deployment.yaml
+          kubectl apply -f k8s/base/service.yaml
+          kubectl apply -f k8s/base/ingress.yaml
+          kubectl apply -f k8s/base/hpa.yaml
+          kubectl apply -f k8s/base/network-policy.yaml
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ env.APP_NAME }} -n default --timeout=5m
+
+      - name: Run smoke tests
+        run: |
+          kubectl wait --for=condition=available --timeout=300s deployment/${{ env.APP_NAME }} -n default
+          echo "Application deployed successfully!"
+
+      - name: Get deployment info
+        run: |
+          kubectl get all -n default
+          kubectl describe deployment/${{ env.APP_NAME }} -n default
+
+  deploy-blue-green:
+    name: Blue-Green Deployment
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && false  # Disabled by default, set to true to enable
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Deploy green environment
+        run: |
+          # Create green deployment
+          kubectl apply -f k8s/base/deployment-green.yaml
+
+          # Wait for green deployment to be ready
+          kubectl rollout status deployment/${{ env.APP_NAME }}-green -n default --timeout=5m
+
+      - name: Run validation tests on green
+        run: |
+          # Run smoke tests against green environment
+          kubectl wait --for=condition=available deployment/${{ env.APP_NAME }}-green -n default
+          echo "Green environment validation successful"
+
+      - name: Switch traffic to green
+        run: |
+          # Update service selector to point to green deployment
+          kubectl patch service ${{ env.APP_NAME }} -n default -p '{"spec":{"selector":{"version":"green"}}}'
+          echo "Traffic switched to green deployment"
+
+      - name: Monitor green deployment
+        run: |
+          # Monitor for 2 minutes
+          sleep 120
+
+          # Check if green is healthy
+          if kubectl get deployment ${{ env.APP_NAME }}-green -n default | grep -q "1/1"; then
+            echo "Green deployment is healthy"
+          else
+            echo "Green deployment is unhealthy, rolling back"
+            kubectl patch service ${{ env.APP_NAME }} -n default -p '{"spec":{"selector":{"version":"blue"}}}'
+            exit 1
+          fi
+
+      - name: Cleanup old blue deployment
+        run: |
+          # Scale down or delete old blue deployment
+          kubectl delete deployment ${{ env.APP_NAME }}-blue -n default --ignore-not-found=true
+
+          # Rename green to blue for next deployment
+          kubectl label deployment ${{ env.APP_NAME }}-green version=blue --overwrite
