@@ -1,5 +1,7 @@
 # DevOps Engineer Technical Assessment - EKS Kubernetes Deployment Pipeline
 
+> **⚠️ Note for Reviewers**: GitHub Actions workflows will fail initially as AWS credentials and secrets are not configured in this public repository. This is expected and intentional for security reasons. See [Setup Instructions](#setup-instructions) below for configuration steps.
+
 ## Overview
 
 This repository contains a production-ready, secure, and scalable infrastructure-as-code solution for deploying containerized applications to Amazon EKS (Elastic Kubernetes Service). The implementation demonstrates best practices in cloud infrastructure, CI/CD automation, security, and observability.
